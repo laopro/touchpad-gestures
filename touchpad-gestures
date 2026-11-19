@@ -37,8 +37,9 @@ DEFAULT = {
     "fingers": 3,
     "sensitivity": 3,          # 1 (lento) .. 10 (rápido)
     "repeat": True,            # acciones continuas se repiten mientras deslizas
-    "actions": {"up": "volume_up", "down": "volume_down", "left": "none", "right": "none"},
-    "commands": {"up": "", "down": "", "left": "", "right": ""},
+    "actions": {"up": "volume_up", "down": "volume_down", "left": "none", "right": "none",
+                "tap": "playpause"},
+    "commands": {"up": "", "down": "", "left": "", "right": "", "tap": ""},
 }
 
 
@@ -84,24 +85,43 @@ RE = re.compile(r'GESTURE_SWIPE_(BEGIN|UPDATE|END)\s+(?:\d+\s+)?\+[\d.]+s\s+(\d+
 
 
 def daemon():
-    cfg, mtime = load(), None
+    state = {"cfg": load(), "mtime": None}
+
+    def refresh():
+        try:
+            mt = os.path.getmtime(CONF)
+        except OSError:
+            mt = None
+        if mt != state["mtime"]:
+            state["cfg"], state["mtime"] = load(), mt
+        return state["cfg"]
+
+    cfg = refresh()
+    pads = set()  # dispositivos touchpad (con capacidad de gestos)
     p = subprocess.Popen(["stdbuf", "-oL", "libinput", "debug-events"],
                          stdout=subprocess.PIPE, text=True, bufsize=1)
     ax = ay = 0.0
     axis = None
     fired = False
     for line in p.stdout:
+        if "DEVICE_ADDED" in line:
+            dm = re.search(r'(event\d+).*\scap:(\S+)', line)
+            if dm and "g" in dm.group(2):
+                pads.add(dm.group(1))
+            continue
+        if "POINTER_BUTTON" in line and "BTN_MIDDLE" in line and " pressed" in line:
+            # libinput convierte el toque con 3 dedos en clic central
+            ev = re.search(r'event\d+', line)
+            if ev and ev.group(0) in pads:
+                cfg = refresh()
+                run_action(cfg["actions"].get("tap", "none"), cfg["commands"].get("tap", ""))
+            continue
         m = RE.search(line)
         if not m:
             continue
         kind, fingers = m.group(1), int(m.group(2))
         if kind == "BEGIN":
-            try:
-                mt = os.path.getmtime(CONF)
-            except OSError:
-                mt = None
-            if mt != mtime:
-                cfg, mtime = load(), mt
+            cfg = refresh()
             ax = ay = 0.0
             axis, fired = None, False
             continue
@@ -226,8 +246,10 @@ def gui():
                                   description="Qué hace cada dirección del deslizamiento")
         page.add(ga)
         labels = Gtk.StringList.new([ACTIONS[a][0] for a in ACTION_IDS])
-        for key, name in DIRS:
+        for key, name in DIRS + [("tap", "Toque con 3 dedos")]:
             combo = Adw.ComboRow(title=name, model=labels)
+            if key == "tap":
+                combo.set_subtitle("También sigue enviando el clic central (pegar)")
             aid = cfg["actions"].get(key, "none")
             combo.set_selected(ACTION_IDS.index(aid) if aid in ACTIONS else 0)
             entry = Adw.EntryRow(title=f"Comando ({name.lower()})")

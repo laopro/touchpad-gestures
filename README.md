@@ -8,6 +8,7 @@ Incluye una interfaz (GTK4 + libadwaita) para elegir:
 - **Número de dedos** (3 o 4)
 - **Acción por dirección** (arriba / abajo / izquierda / derecha): volumen, silenciar, brillo, multimedia (play/pausa, siguiente, anterior, adelantar, retroceder), vista general, cuadrícula, mostrar escritorio, cambiar de escritorio virtual o un comando personalizado
 - **Repetición continua** mientras deslizas (volumen, brillo, búsqueda)
+- **Toque con 3 dedos**: cualquier acción de la lista (por defecto reproducir/pausar)
 
 Los cambios se aplican al instante, sin reiniciar el servicio.
 
