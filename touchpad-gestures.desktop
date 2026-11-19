@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Gestos del touchpad
+Comment=Configura sensibilidad y acciones de los gestos de 3 dedos
+Exec=touchpad-gestures
+Icon=input-touchpad
+Categories=Settings;HardwareSettings;
+Keywords=touchpad;gestos;volumen;

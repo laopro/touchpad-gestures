@@ -1,0 +1,285 @@
+#!/usr/bin/env python3
+"""Gestos de touchpad configurables.
+
+  touchpad-gestures          -> abre la interfaz de configuración
+  touchpad-gestures daemon   -> escucha gestos (lo usa el servicio systemd)
+"""
+import json, os, re, shlex, subprocess, sys
+
+CONF_DIR = os.path.expanduser("~/.config/touchpad-gestures")
+CONF = os.path.join(CONF_DIR, "config.json")
+SERVICE = "touchpad-gestures.service"
+DIRS = [("up", "Arriba"), ("down", "Abajo"), ("left", "Izquierda"), ("right", "Derecha")]
+
+# id: (etiqueta, componente kglobalaccel, atajo, continua)
+ACTIONS = {
+    "none":            ("Ninguna", None, None, False),
+    "volume_up":       ("Subir volumen", "kmix", "increase_volume", True),
+    "volume_down":     ("Bajar volumen", "kmix", "decrease_volume", True),
+    "mute":            ("Silenciar / activar sonido", "kmix", "mute", False),
+    "brightness_up":   ("Subir brillo", "org_kde_powerdevil", "Increase Screen Brightness", True),
+    "brightness_down": ("Bajar brillo", "org_kde_powerdevil", "Decrease Screen Brightness", True),
+    "playpause":       ("Reproducir / pausar", "mediacontrol", "playpausemedia", False),
+    "next":            ("Siguiente pista", "mediacontrol", "nextmedia", False),
+    "previous":        ("Pista anterior", "mediacontrol", "previousmedia", False),
+    "seek_fwd":        ("Adelantar (multimedia)", "mediacontrol", "seekforwardmedia", True),
+    "seek_back":       ("Retroceder (multimedia)", "mediacontrol", "seekbackwardmedia", True),
+    "overview":        ("Vista general (Overview)", "kwin", "Overview", False),
+    "grid":            ("Vista de cuadrícula", "kwin", "Grid View", False),
+    "show_desktop":    ("Mostrar escritorio", "kwin", "Show Desktop", False),
+    "desk_right":      ("Escritorio virtual siguiente", "kwin", "Switch One Desktop to the Right", False),
+    "desk_left":       ("Escritorio virtual anterior", "kwin", "Switch One Desktop to the Left", False),
+    "command":         ("Comando personalizado…", None, None, False),
+}
+ACTION_IDS = list(ACTIONS)
+
+DEFAULT = {
+    "fingers": 3,
+    "sensitivity": 3,          # 1 (lento) .. 10 (rápido)
+    "repeat": True,            # acciones continuas se repiten mientras deslizas
+    "actions": {"up": "volume_up", "down": "volume_down", "left": "none", "right": "none"},
+    "commands": {"up": "", "down": "", "left": "", "right": ""},
+}
+
+
+def load():
+    cfg = json.loads(json.dumps(DEFAULT))
+    try:
+        with open(CONF) as f:
+            user = json.load(f)
+        for k, v in user.items():
+            if isinstance(v, dict):
+                cfg[k].update(v)
+            else:
+                cfg[k] = v
+    except (OSError, ValueError):
+        pass
+    return cfg
+
+
+def save(cfg):
+    os.makedirs(CONF_DIR, exist_ok=True)
+    tmp = CONF + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(cfg, f, indent=2)
+    os.replace(tmp, CONF)
+
+
+def run_action(aid, cmd=""):
+    label, comp, name, _ = ACTIONS.get(aid, ACTIONS["none"])
+    if comp:
+        args = ["qdbus", "org.kde.kglobalaccel", f"/component/{comp}",
+                "org.kde.kglobalaccel.Component.invokeShortcut", name]
+    elif aid == "command" and cmd.strip():
+        args = ["sh", "-c", cmd]
+    else:
+        return
+    subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                     start_new_session=True)
+
+
+# ───────────────────────── daemon ─────────────────────────
+RE = re.compile(r'GESTURE_SWIPE_(BEGIN|UPDATE|END)\s+(?:\d+\s+)?\+[\d.]+s\s+(\d+)'
+                r'(?:\s+([-\d.]+)/\s*([-\d.]+))?')
+
+
+def daemon():
+    cfg, mtime = load(), None
+    p = subprocess.Popen(["stdbuf", "-oL", "libinput", "debug-events"],
+                         stdout=subprocess.PIPE, text=True, bufsize=1)
+    ax = ay = 0.0
+    axis = None
+    fired = False
+    for line in p.stdout:
+        m = RE.search(line)
+        if not m:
+            continue
+        kind, fingers = m.group(1), int(m.group(2))
+        if kind == "BEGIN":
+            try:
+                mt = os.path.getmtime(CONF)
+            except OSError:
+                mt = None
+            if mt != mtime:
+                cfg, mtime = load(), mt
+            ax = ay = 0.0
+            axis, fired = None, False
+            continue
+        if kind == "END" or fingers != int(cfg["fingers"]) or m.group(4) is None:
+            continue
+        dx, dy = float(m.group(3)), float(m.group(4))
+        ax += dx
+        ay += dy
+        step = 120.0 / max(1, min(10, int(cfg["sensitivity"])))
+        if axis is None:
+            if max(abs(ax), abs(ay)) < step / 3:
+                continue
+            axis = "y" if abs(ay) >= abs(ax) else "x"
+        acc = ay if axis == "y" else ax
+        while abs(acc) >= step:
+            sign = 1 if acc > 0 else -1
+            d = ("down" if sign > 0 else "up") if axis == "y" else ("right" if sign > 0 else "left")
+            aid = cfg["actions"].get(d, "none")
+            continuous = ACTIONS.get(aid, ACTIONS["none"])[3] and cfg.get("repeat", True)
+            if continuous or not fired:
+                run_action(aid, cfg["commands"].get(d, ""))
+                fired = True
+            acc -= sign * step
+            if not continuous:
+                acc = 0.0
+        if axis == "y":
+            ay = acc
+        else:
+            ax = acc
+    sys.exit(1)
+
+
+# ───────────────────────── GUI ─────────────────────────
+def gui():
+    import gi
+    gi.require_version("Gtk", "4.0")
+    gi.require_version("Adw", "1")
+    from gi.repository import Adw, Gtk
+
+    cfg = load()
+
+    def systemctl(*a):
+        return subprocess.run(["systemctl", "--user", *a, SERVICE],
+                              capture_output=True, text=True).stdout.strip()
+
+    def on_activate(app):
+        win = Adw.ApplicationWindow(application=app, title="Gestos del touchpad")
+        win.set_default_size(560, 720)
+        toast = Adw.ToastOverlay()
+        view = Adw.ToolbarView()
+        view.add_top_bar(Adw.HeaderBar())
+        page = Adw.PreferencesPage()
+        view.set_content(page)
+        toast.set_child(view)
+        win.set_content(toast)
+
+        def commit(*_):
+            save(cfg)
+
+        # General
+        g = Adw.PreferencesGroup(title="General",
+                                 description="Los cambios se aplican al instante.")
+        page.add(g)
+
+        on = Adw.SwitchRow(title="Gestos activados",
+                           subtitle="Servicio en segundo plano, arranca con la sesión")
+        on.set_active(systemctl("is-active") == "active")
+
+        def toggle(row, _p):
+            if row.get_active():
+                systemctl("enable", "--now")
+            else:
+                systemctl("disable", "--now")
+            toast.add_toast(Adw.Toast(title="Activado" if row.get_active() else "Desactivado",
+                                      timeout=1))
+        on.connect("notify::active", toggle)
+        g.add(on)
+
+        fing = Adw.ComboRow(title="Número de dedos",
+                            subtitle="4 dedos puede chocar con los gestos de KDE",
+                            model=Gtk.StringList.new(["3 dedos", "4 dedos"]))
+        fing.set_selected(0 if int(cfg["fingers"]) == 3 else 1)
+
+        def set_fing(row, _p):
+            cfg["fingers"] = 3 + row.get_selected()
+            commit()
+        fing.connect("notify::selected", set_fing)
+        g.add(fing)
+
+        sens = Adw.ActionRow(title="Sensibilidad",
+                             subtitle="Más alto = menos recorrido por cada paso")
+        scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 1, 10, 1)
+        scale.set_value(int(cfg["sensitivity"]))
+        scale.set_digits(0)
+        scale.set_draw_value(True)
+        scale.set_hexpand(True)
+        scale.set_size_request(220, -1)
+        for v in (1, 5, 10):
+            scale.add_mark(v, Gtk.PositionType.BOTTOM, None)
+
+        def set_sens(s):
+            v = int(round(s.get_value()))
+            if v != cfg["sensitivity"]:
+                cfg["sensitivity"] = v
+                commit()
+        scale.connect("value-changed", set_sens)
+        sens.add_suffix(scale)
+        g.add(sens)
+
+        rep = Adw.SwitchRow(title="Repetir mientras deslizas",
+                            subtitle="Volumen, brillo y búsqueda avanzan de forma continua")
+        rep.set_active(bool(cfg.get("repeat", True)))
+
+        def set_rep(row, _p):
+            cfg["repeat"] = row.get_active()
+            commit()
+        rep.connect("notify::active", set_rep)
+        g.add(rep)
+
+        # Acciones
+        ga = Adw.PreferencesGroup(title="Acciones",
+                                  description="Qué hace cada dirección del deslizamiento")
+        page.add(ga)
+        labels = Gtk.StringList.new([ACTIONS[a][0] for a in ACTION_IDS])
+        for key, name in DIRS:
+            combo = Adw.ComboRow(title=name, model=labels)
+            aid = cfg["actions"].get(key, "none")
+            combo.set_selected(ACTION_IDS.index(aid) if aid in ACTIONS else 0)
+            entry = Adw.EntryRow(title=f"Comando ({name.lower()})")
+            entry.set_text(cfg["commands"].get(key, ""))
+            entry.set_show_apply_button(True)
+            entry.set_visible(aid == "command")
+
+            def set_action(row, _p, key=key, entry=entry):
+                a = ACTION_IDS[row.get_selected()]
+                cfg["actions"][key] = a
+                entry.set_visible(a == "command")
+                commit()
+
+            def set_cmd(e, key=key):
+                cfg["commands"][key] = e.get_text()
+                commit()
+                toast.add_toast(Adw.Toast(title="Comando guardado", timeout=1))
+
+            test = Gtk.Button(icon_name="media-playback-start-symbolic",
+                              valign=Gtk.Align.CENTER, tooltip_text="Probar acción")
+            test.add_css_class("flat")
+            test.connect("clicked", lambda _b, key=key: run_action(
+                cfg["actions"].get(key, "none"), cfg["commands"].get(key, "")))
+            combo.add_suffix(test)
+            combo.connect("notify::selected", set_action)
+            entry.connect("apply", set_cmd)
+            ga.add(combo)
+            ga.add(entry)
+
+        gr = Adw.PreferencesGroup()
+        page.add(gr)
+        reset = Gtk.Button(label="Restaurar valores por defecto", halign=Gtk.Align.CENTER)
+        reset.add_css_class("pill")
+
+        def do_reset(_b):
+            save(json.loads(json.dumps(DEFAULT)))
+            cfg.clear(); cfg.update(load())
+            win.close()
+            on_activate(app)
+        reset.connect("clicked", do_reset)
+        gr.add(reset)
+
+        win.present()
+
+    def activate(app):
+        cfg.clear(); cfg.update(load())
+        on_activate(app)
+
+    app = Adw.Application(application_id="io.github.laopro.TouchpadGestures")
+    app.connect("activate", activate)
+    app.run([])
+
+
+if __name__ == "__main__":
+    daemon() if sys.argv[1:2] == ["daemon"] else gui()
